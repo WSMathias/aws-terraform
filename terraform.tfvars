@@ -1,5 +1,7 @@
 env = "dev"
 
+ec2_ami = "ami-0127d62154efde733"
+
 vpc_cider = "10.0.0.0/16"
 
 public_ciders = [

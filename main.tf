@@ -5,7 +5,6 @@ provider "aws" {
   profile = "default"
 }
 
-
 # https://github.com/terraform-aws-modules/terraform-aws-vpc
 module "vpc" {
   source = "terraform-aws-modules/vpc/aws"
@@ -38,8 +37,9 @@ module "app-sg" {
 
   # Public subnet ciders
   ingress_cidr_blocks = var.public_ciders
-  ingress_rules            = ["http-80-tcp"]
+  ingress_rules       = ["http-80-tcp", "ssh-tcp"]
 
+  egress_rules = ["all-all"]
 
   tags = {
     Terraform   = "true"
@@ -55,10 +55,12 @@ module "db-sg" {
   name        = "DB-SG"
   description = "Security group with HTTP ports open for everybody (IPv4 CIDR), egress ports are all world open"
   vpc_id      = module.vpc.vpc_id
-  
+
   # private subnet ciders
-  ingress_cidr_blocks = var.private_ciders 
-  ingress_rules     = ["mysql-tcp"]
+  ingress_cidr_blocks = var.private_ciders
+  ingress_rules       = ["mysql-tcp"]
+
+  egress_rules = ["all-all"]
 
 
   tags = {
@@ -76,7 +78,10 @@ module "public-lb-sg" {
   vpc_id      = module.vpc.vpc_id
 
   ingress_cidr_blocks = ["0.0.0.0/0"]
-  ingress_rules            = ["https-443-tcp", "http-80-tcp"]
+  ingress_rules       = ["https-443-tcp", "http-80-tcp"]
+
+  egress_rules = ["all-all"]
+
 
   tags = {
     Terraform   = "true"
@@ -97,7 +102,7 @@ module "db" {
   allocated_storage = 5
 
   name     = "demodb"
-  username = "user"
+  username = "demouser"
   password = "YourPwdShouldBeLongAndSecure!"
   port     = "3306"
 
@@ -118,8 +123,10 @@ module "db" {
   # DB option group
   major_engine_version = "5.7"
 
-  # Snapshot name upon DB deletion
-  final_snapshot_identifier = "demodb"
+  # Snapshot name upon DB deletion 
+  skip_final_snapshot     = true
+  backup_retention_period = 0
+  # final_snapshot_identifier = "demodb"
 
   # Database Deletion Protection
   deletion_protection = false
@@ -141,25 +148,115 @@ module "db" {
   }
 }
 
-# https://github.com/terraform-aws-modules/terraform-aws-ec2-instance
-module "ec2_instances" {
-  source  = "terraform-aws-modules/ec2-instance/aws"
-  version = "~> 2.0"
 
-  instance_count = var.ec2_number_of_instances
-
-  name                   = var.name
-  ami                    = var.ec2_ami
-  instance_type          = var.ec2_instance_type
-  vpc_security_group_ids = [module.app-sg.this_security_group_id]
-  subnet_id              = module.vpc.private_subnets[0]
-  iam_instance_profile   = aws_iam_instance_profile.app_instance_profile.name
-
-  tags = {
-    Terraform   = "true"
-    Environment = var.env
-  }
+module "secret-lambda" {
+  source         = "./modules/aws-rotation-lambda"
+  name           = "SecretManager"
+  security_group = module.app-sg.this_security_group_id
+  subnets        = module.vpc.private_subnets
 }
+
+
+module "secret-manager-with-rotation" {
+  source                     = "./modules/aws-secret-manager"
+  name                       = "MasterUser"
+  enable_rotation            = true
+  rotation_schedule          = "rate(90 days)"
+  rotation_lambda_arn        = module.secret-lambda.rotation_lambda_arn
+  mysql_username             = module.db.this_db_instance_username
+  mysql_password             = module.db.this_db_instance_password
+  mysql_dbname               = module.db.this_db_instance_name
+  mysql_host                 = module.db.this_db_instance_address
+  mysql_port                 = module.db.this_db_instance_port
+  mysql_dbInstanceIdentifier = module.db.this_db_instance_id
+}
+
+
+# resource "aws_key_pair" "deployer" {
+#   key_name   = "secret-demo"
+#   public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCVTMvcoyACvqsAwnNJ6L5bSws66awG/klzr0stLPl1W036XscBBSw8PSic1glLGjWz7PptYAx22ahMOnAovgTrkoXIZEdXVw7Yljda54Btm4BKPfdfzw/K7gHvlZqhgx8lHH+unY33yAe9bdeJqvaZ6LHYQj0ZgXUKwlKy9kTgn88kLizxPknMhfUvCLmLLQVuLqrKhXyYSs1bUpiGHCsq9IxrQxd5dYl09uW0cJtKy7+WOllQzxC0iL6yaTM34hz1c9Y9BD3Aq4YTBLaiur/8q2pFZnDFR0C5k3xCnze7lPN6vITwqBoTXu4jUdSb/6EsaXDiIsyJNVtwKW0VrtTx"
+# }
+
+module "asg" {
+  source  = "terraform-aws-modules/autoscaling/aws"
+  version = "~> 3.0"
+
+  name = "service"
+
+  # Launch configuration
+  lc_name = "demo-lc"
+
+  image_id             = var.ec2_ami
+  instance_type        = var.ec2_instance_type
+  security_groups      = [module.app-sg.this_security_group_id]
+  iam_instance_profile = aws_iam_instance_profile.app_instance_profile.name
+
+  target_group_arns = module.alb.target_group_arns
+
+  user_data         = data.template_cloudinit_config.config.rendered
+
+  #   ebs_block_device = [
+  #     {
+  #       device_name           = "/dev/xvdz"
+  #       volume_type           = "gp2"
+  #       volume_size           = "50"
+  #       delete_on_termination = true
+  #     },
+  #   ]
+
+  root_block_device = [
+    {
+      volume_size = "20"
+      volume_type = "gp2"
+    },
+  ]
+
+  # Auto scaling group
+  asg_name                  = "my-asg"
+  vpc_zone_identifier       = module.vpc.private_subnets
+  health_check_type         = "EC2"
+  min_size                  = 0
+  max_size                  = 1
+  desired_capacity          = 1
+  wait_for_capacity_timeout = 0
+
+  tags = [
+    {
+      key                 = "Environment"
+      value               = "dev"
+      propagate_at_launch = true
+    },
+    {
+      key                 = "Terraform"
+      value               = "true"
+      propagate_at_launch = true
+    },
+  ]
+}
+
+# # https://github.com/terraform-aws-modules/terraform-aws-ec2-instance
+# module "ec2_instances" {
+#   source  = "terraform-aws-modules/ec2-instance/aws"
+#   version = "~> 2.0"
+
+#   instance_count = var.ec2_number_of_instances
+
+#   name                        = "Bastion host"
+#   ami                         = var.ec2_ami
+#   instance_type               = var.ec2_instance_type
+#   vpc_security_group_ids      = [module.app-sg.this_security_group_id]
+#   subnet_id                   = module.vpc.public_subnets[0]
+#   iam_instance_profile        = aws_iam_instance_profile.app_instance_profile.name
+#   key_name                    = aws_key_pair.deployer.key_name
+#   user_data                   = data.template_cloudinit_config.config.rendered
+#   associate_public_ip_address = true
+
+
+#   tags = {
+#     Terraform   = "true"
+#     Environment = var.env
+#   }
+# }
 
 
 # https://github.com/terraform-aws-modules/terraform-aws-alb
@@ -207,17 +304,17 @@ module "alb" {
   }
 }
 
-# alb module lacks this feature
-resource "aws_lb_target_group_attachment" "attach" {
-  target_group_arn = module.alb.target_group_arns[0]
-  target_id        = module.ec2_instances.id[0]
-  port             = 80
-}
 
 # Enable session manager
 resource "aws_iam_role_policy_attachment" "attach-ssm-policy" {
   role       = aws_iam_role.role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# Permission to fetch secrets
+resource "aws_iam_role_policy_attachment" "attach-secretmanager-policy" {
+  role       = aws_iam_role.role.name
+  policy_arn = aws_iam_policy.read_secrets.arn
 }
 
 resource "aws_iam_instance_profile" "app_instance_profile" {
@@ -246,5 +343,21 @@ resource "aws_iam_role" "role" {
 EOF
 }
 
-
-
+resource "aws_iam_policy" "read_secrets" {
+  name        = "SecretmanagerReadOnly"
+  description = "Seacret Manager read only policy"
+  policy      = <<POLICY
+{
+    "Version": "2012-10-17",
+    "Statement": {
+        "Effect": "Allow",
+        "Action": [
+            "secretsmanager:Describe*",
+            "secretsmanager:Get*",
+            "secretsmanager:List*" 
+        ],
+        "Resource": "*"
+    }
+}
+ POLICY
+}

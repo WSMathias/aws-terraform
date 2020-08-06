@@ -1,12 +1,12 @@
 variable "name" {
   description = "Name to be used on all resources as prefix"
-  default = "test"
+  default     = "test"
   type        = string
 }
 
 variable "env" {
   description = "Environment name"
-  default = "dev"
+  default     = "dev"
   type        = string
 }
 
@@ -42,12 +42,12 @@ variable "ec2_number_of_instances" {
 
 variable "ec2_ami" {
   description = "ID of AMI to use for the instance"
-  default = "ami-089cc16f7f08c4457"
+  default     = "ami-089cc16f7f08c4457"
   type        = string
 }
 
 variable "ec2_instance_type" {
   description = "The type of instance to start"
-  default = "t2.micro"
+  default     = "t2.micro"
   type        = string
 }
